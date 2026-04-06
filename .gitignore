@@ -1,0 +1,107 @@
+# =========================
+# Python bytecode / cache
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Virtual environments
+# =========================
+venv/
+.env/
+.env.*
+.venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# =========================
+# Environment variables
+# =========================
+.env
+.env.local
+.env.production
+.env.development
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+log/
+
+# =========================
+# Test / coverage reports
+# =========================
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.pytest_cache/
+
+# =========================
+# Build / distribution
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# =========================
+# IDE / Editor files
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+
+# =========================
+# OS-specific files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# FastAPI / Uvicorn
+# =========================
+*.pid
+
+# =========================
+# Jupyter / Notebooks
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Node (if frontend exists)
+# =========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# =========================
+# Secrets / keys
+# =========================
+*.pem
+*.key
+*.crt
+
+# =========================
+# AI / Model artifacts (optional)
+# =========================
+checkpoints/
+*.onnx
+*.pt
+*.pth
+*.dat
+*.mp3
+*.dir
+*.pdf
+*.doc
+*.docx
+credentials/
+*.json
+.env
