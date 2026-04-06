@@ -41,6 +41,7 @@ from .appointment import appointment_service
 from .google_calendar import google_calendar_service
 from .email import email_service
 from .time_parser import time_parser_service
+from .card_validator import validate_card_number, validate_expiry, validate_cvc, lookup_bin
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -469,6 +470,36 @@ class AgentExecutor:
             except Exception as follow_up_error:
                 logger.warning(f"⚠️ Follow-up detection error (continuing): {follow_up_error}")
             
+            # ============================================
+            # PRIORITY 3.5: MID-CALL RECONNECT ("hello", "are you there?")
+            # ============================================
+            # When the user says a reconnect phrase mid-call, do NOT re-pitch.
+            # Just acknowledge and resume from the last question/topic.
+            _reconnect_phrases = [
+                "hello", "hey", "hi", "are you there", "can you hear me",
+                "hello?", "hey?", "you there", "still there", "anyone there",
+                "hello hello", "hellooo", "is anyone there", "hello are you there",
+            ]
+            is_reconnect = user_input_lower.strip().rstrip("?!.") in _reconnect_phrases or \
+                           user_input_lower.strip() in _reconnect_phrases
+
+            if is_reconnect:
+                memory_key = call_sid or call_id
+                memory = await call_memory_service.get_memory(memory_key, db)
+                if memory.get("turn_count", 0) > 0:
+                    logger.info("📞 PRIORITY 3.5: Mid-call reconnect — resuming conversation")
+                    # Resume from the last assistant question/topic
+                    history = memory.get("history", [])
+                    last_agent_msg = next(
+                        (m["content"] for m in reversed(history) if m.get("role") == "assistant"),
+                        None
+                    )
+                    if last_agent_msg:
+                        # Trim to the first sentence so we don't repeat a long message
+                        first_sentence = last_agent_msg.split(".")[0].strip()
+                        return f"Yes, I'm still here! {first_sentence}?"
+                    return "Yes, I'm still here! Could you repeat what you were saying?"
+
             # ============================================
             # PRIORITY 4: FAST CONTEXTUAL RESPONSE (SALES FOCUS!)
             # ============================================
@@ -1539,13 +1570,23 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
             elif step == "card_number":
                 card_number = self._extract_card_number(user_input)
                 if card_number:
+                    # ✅ Validate via Luhn algorithm + card type detection
+                    validation = validate_card_number(card_number)
+                    if not validation["valid"]:
+                        logger.info(f"💳 [CARD-INVALID] {validation['error']} for input: {user_input[:40]}")
+                        return validation["voice_message"]
+
+                    # Store card number and detected card type
                     collected["card_number"] = card_number
+                    collected["card_type"] = validation["card_type"]["type"]
+                    collected["card_type_name"] = validation["card_type"]["name"]
                     state["step"] = "confirm_card"
-                    # Read back all 16 digits in groups of 4 for user to verify
-                    groups = [card_number[i:i+4] for i in range(0, 16, 4)]
+
+                    # Read back all digits in groups of 4 for user to verify
+                    groups = [card_number[i:i+4] for i in range(0, len(card_number), 4)]
                     groups_spoken = ", ".join([" ".join(g) for g in groups])
                     return (
-                        f"I have your card number as {groups_spoken}. "
+                        f"I have your {validation['card_type']['name']} card number as {groups_spoken}. "
                         f"Is that correct?"
                     )
                 return (
@@ -1575,16 +1616,33 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
             elif step == "expiry":
                 expiry = self._extract_expiry_date(user_input)
                 if expiry:
+                    # ✅ Validate expiry is not in the past
+                    expiry_check = validate_expiry(expiry)
+                    if not expiry_check["valid"]:
+                        logger.info(f"💳 [EXPIRY-INVALID] {expiry_check['error']} for '{expiry}'")
+                        return expiry_check["voice_message"]
+
                     collected["expiry_date"] = expiry
                     state["step"] = "cvc"
-                    return f"Expiry {expiry} noted. And finally, what is the 3 or 4 digit security code on the back of your card?"
+                    cvc_digits = "4" if collected.get("card_type") == "amex" else "3"
+                    return (
+                        f"Expiry {expiry} noted. "
+                        f"And finally, what is the {cvc_digits}-digit security code on the back of your card?"
+                    )
                 return "I didn't catch that. Could you say the expiry date again? For example: 'twelve twenty six' for December 2026."
 
             # ── Step: CVC ─────────────────────────────────────────────────────
             elif step == "cvc":
                 cvc = self._extract_cvc(user_input)
                 if cvc:
-                    collected["cvc"] = cvc
+                    # ✅ Validate CVC length against detected card type (Amex = 4, others = 3)
+                    card_type = collected.get("card_type", "unknown")
+                    cvc_check = validate_cvc(cvc, card_type)
+                    if not cvc_check["valid"]:
+                        logger.info(f"💳 [CVC-INVALID] {cvc_check['error']}")
+                        return cvc_check["voice_message"]
+
+                    collected["cvc"] = cvc_check["cvc"]
                     state["step"] = "confirm"
                     name = collected.get("cardholder_name", "")
                     last4 = collected.get("card_number", "")[-4:]

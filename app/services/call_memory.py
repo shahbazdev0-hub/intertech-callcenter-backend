@@ -295,9 +295,33 @@ class CallMemoryService:
         if has_introduced or turn_count > 0:
             enhanced_prompt += """
 ⚠️ CRITICAL RULE - NO RE-INTRODUCTION:
-You have ALREADY introduced yourself. Do NOT repeat your name, company name, 
+You have ALREADY introduced yourself. Do NOT repeat your name, company name,
 or greeting. Do NOT say "Hi, I'm..." or "This is..." again.
 Just continue the conversation naturally from where we left off.
+"""
+
+        # Tell the LLM exactly what is already known — so it never asks again
+        known_facts = []
+        customer_name = memory.get("customer_name")
+        if customer_name:
+            known_facts.append(f"- Customer's name: {customer_name} (do NOT ask their name again)")
+        if memory.get("customer_interests"):
+            last_interest = memory["customer_interests"][-1][:80]
+            known_facts.append(f"- Customer already expressed interest in: {last_interest}")
+        if memory.get("objections"):
+            last_objection = memory["objections"][-1][:80]
+            known_facts.append(f"- Customer raised this concern: {last_objection}")
+
+        if known_facts:
+            enhanced_prompt += "\n⛔ ALREADY KNOWN — DO NOT ASK AGAIN:\n" + "\n".join(known_facts) + "\n"
+
+        # Mid-call reconnect rule: if user says hello/hey mid-call, just continue
+        if turn_count > 0:
+            enhanced_prompt += """
+📞 MID-CALL RECONNECT RULE:
+If the customer says "hello", "hey", "are you there", "can you hear me", or similar,
+do NOT re-introduce yourself or re-pitch services. Simply acknowledge ("Yes, I'm here!")
+and continue from where the conversation left off.
 """
         
         # Add stage-specific instructions
