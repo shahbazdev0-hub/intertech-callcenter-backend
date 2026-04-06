@@ -100,6 +100,10 @@ class AudioStreamHandler:
         self.email_request_context = None   # What details to send
         self._pending_email_correction = False  # Waiting for corrected email after booking
 
+        # ✅ Lock: prevents two process_user_utterance tasks running at the same time
+        # (silence timer can fire twice quickly — without this both play TTS concurrently)
+        self._utterance_lock = asyncio.Lock()
+
         # ✅ NEW: Appointment booking keywords (matches agent_executor)
         self.BOOKING_KEYWORDS = [
             "appointment", "schedule", "booking", "book", "meeting",
@@ -715,7 +719,20 @@ class AudioStreamHandler:
                     if transcript_buffer:
                         buffer_text = " ".join(transcript_buffer).lower()
                         has_callback_keyword = any(phrase in buffer_text for phrase in ["call me", "call back", "callback", "call later"])
-                        timeout = CALLBACK_SILENCE_TIMEOUT if has_callback_keyword else SILENCE_TIMEOUT
+
+                        # ✅ Use a longer silence timeout during card number dictation.
+                        # Users pause between groups of digits ("one two three four" …pause… "five six"),
+                        # so 0.5 s fires too early and cuts off mid-number.
+                        payment_state = self.agent_executor.active_payments.get(call_id, {})
+                        payment_step = payment_state.get("step", "")
+                        if payment_step == "card_number":
+                            timeout = 2.0   # 16 digits take time — wait for a real pause
+                        elif payment_step in ("cardholder_name", "expiry", "cvc", "confirm"):
+                            timeout = 1.2   # Slightly longer for other payment inputs
+                        elif has_callback_keyword:
+                            timeout = CALLBACK_SILENCE_TIMEOUT
+                        else:
+                            timeout = SILENCE_TIMEOUT
                     else:
                         timeout = SILENCE_TIMEOUT
 
@@ -1074,6 +1091,40 @@ class AudioStreamHandler:
             print(f"🚫 [HANGUP-IN-PROGRESS] Ignoring input, hangup already triggered")
             return
 
+        # ✅ Only one utterance should be processed at a time.
+        # If the lock is already held (previous utterance still generating/playing),
+        # discard this one to avoid overlapping audio.
+        if self._utterance_lock.locked():
+            print(f"🚫 [UTTERANCE-LOCK] Already processing an utterance, discarding: '{text[:50]}'")
+            return
+
+        async with self._utterance_lock:
+            # ✅ Cancel any TTS that is still playing from the previous turn
+            if self.tts_task and not self.tts_task.done():
+                print(f"🛑 [TTS-CANCEL] Cancelling previous TTS before new response")
+                self.tts_task.cancel()
+                try:
+                    await self.tts_task
+                except asyncio.CancelledError:
+                    pass
+                self.is_speaking = False
+
+            await self._process_user_utterance_inner(
+                text, websocket, call_sid, agent_config, user_id, call_id, db, stream_sid
+            )
+
+    async def _process_user_utterance_inner(
+        self,
+        text: str,
+        websocket,
+        call_sid: str,
+        agent_config,
+        user_id,
+        call_id,
+        db,
+        stream_sid: str
+    ):
+        """Inner implementation — called under _utterance_lock."""
         # Wait for greeting to finish before processing any user input
         if not self.greeting_done.is_set():
             print(f"⏳ [WAITING] Holding response until greeting finishes...")

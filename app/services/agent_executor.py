@@ -1498,33 +1498,41 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
 
             # ── Step: Cardholder Name ─────────────────────────────────────────
             if step == "cardholder_name":
-                name = self._extract_name(user_input)
-                if not name:
-                    # Strip common spoken prefixes before accepting as a name
-                    clean = user_input.strip()
-                    _name_prefixes = [
-                        "my name is ", "the name is ", "name is ", "it's ", "its ",
-                        "it is ", "this is ", "i am ", "i'm ", "call me ",
-                        "yes ", "yeah ", "sure ", "ok ", "okay ", "um ", "uh ",
-                        "so ", "well ", "right ",
-                    ]
-                    clean_lower = clean.lower()
-                    for prefix in _name_prefixes:
-                        if clean_lower.startswith(prefix):
-                            clean = clean[len(prefix):].strip()
-                            clean_lower = clean.lower()
+                # Pre-clean the input: strip leading filler words/phrases including
+                # punctuation variants like "yes, " or "yes," before any extraction.
+                _leading_fillers = [
+                    "my name is", "the name is", "name is", "it's", "its",
+                    "it is", "this is", "i am", "i'm", "call me",
+                    "yes", "yeah", "sure", "ok", "okay", "um", "uh",
+                    "so", "well", "right", "hello", "hi",
+                ]
+                cleaned_input = user_input.strip()
+                cleaned_lower = cleaned_input.lower()
+                # Strip one leading filler (handles "yes, my name is..." or "yes my name is...")
+                for filler in sorted(_leading_fillers, key=len, reverse=True):
+                    if cleaned_lower.startswith(filler):
+                        after = cleaned_input[len(filler):].lstrip(" ,.")
+                        if after:  # only strip if something remains
+                            cleaned_input = after.strip()
+                            cleaned_lower = cleaned_input.lower()
                             break
-                    # Accept if it looks like a real name: 2–40 chars, no digits, max 3 words
-                    words = clean.split()
-                    if (2 <= len(clean) <= 40
-                            and not any(c.isdigit() for c in clean)
-                            and 1 <= len(words) <= 3):
-                        name = clean.title()
+
+                # Try structured extraction first (handles "my name is X" patterns)
+                name = self._extract_name(cleaned_input)
+
+                if not name:
+                    # Fallback: accept anything that looks like a name after cleaning
+                    # Allow up to 4 words to handle "First Middle Last" or names with Jr/Sr
+                    words = cleaned_input.split()
+                    if (2 <= len(cleaned_input) <= 50
+                            and not any(c.isdigit() for c in cleaned_input)
+                            and 1 <= len(words) <= 4):
+                        name = cleaned_input.title()
 
                 if name:
                     collected["cardholder_name"] = name
                     state["step"] = "card_number"
-                    return f"Thank you, {name}. Now, could you please read me your 16-digit card number?"
+                    return f"Thank you, {name}. Now, could you please read me your 16-digit card number, one digit at a time?"
                 return "I didn't catch that. Could you please tell me the name as it appears on your card?"
 
             # ── Step: Card Number ─────────────────────────────────────────────
@@ -1532,14 +1540,36 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
                 card_number = self._extract_card_number(user_input)
                 if card_number:
                     collected["card_number"] = card_number
-                    state["step"] = "expiry"
-                    # Read back last 4 digits for confirmation
-                    last4 = card_number[-4:]
-                    return f"Got it, ending in {' '.join(last4)}. What is the expiry date on your card? For example, you can say 'twelve twenty six' for December 2026."
+                    state["step"] = "confirm_card"
+                    # Read back all 16 digits in groups of 4 for user to verify
+                    groups = [card_number[i:i+4] for i in range(0, 16, 4)]
+                    groups_spoken = ", ".join([" ".join(g) for g in groups])
+                    return (
+                        f"I have your card number as {groups_spoken}. "
+                        f"Is that correct?"
+                    )
                 return (
                     "I didn't quite catch all 16 digits. Could you read your card number again, "
                     "one digit at a time? For example: one, two, three, four..."
                 )
+
+            # ── Step: Confirm Card Number ─────────────────────────────────────
+            elif step == "confirm_card":
+                confirmed = any(w in user_input_lower for w in [
+                    "yes", "yeah", "correct", "right", "yep", "that's right",
+                    "that is correct", "confirm", "confirmed", "go ahead",
+                ])
+                rejected = any(w in user_input_lower for w in [
+                    "no", "nope", "wrong", "incorrect", "not right", "that's wrong",
+                ])
+                if confirmed:
+                    state["step"] = "expiry"
+                    return "Great! What is the expiry date on your card? For example, say 'twelve twenty six' for December 2026."
+                if rejected:
+                    del collected["card_number"]
+                    state["step"] = "card_number"
+                    return "No problem! Could you please read me your card number again, one digit at a time?"
+                return "Could you say 'yes' if the card number is correct, or 'no' to re-enter it?"
 
             # ── Step: Expiry Date ─────────────────────────────────────────────
             elif step == "expiry":
