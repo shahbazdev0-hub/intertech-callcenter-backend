@@ -1689,8 +1689,8 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
 
                     if result.get("success"):
                         return (
-                            "Your payment details have been securely recorded. "
-                            "Our team will process your order and reach out shortly. "
+                            "Your card details have been securely recorded. "
+                            "Our team will review everything and reach out to you shortly to confirm your enrollment. "
                             "Is there anything else I can help you with today?"
                         )
                     else:
@@ -1704,7 +1704,7 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
             logger.error(f"❌ Error in payment collection: {e}", exc_info=True)
             if call_id in self.active_payments:
                 del self.active_payments[call_id]
-            return "I apologize, there was an issue processing your payment details. Please try again."
+            return "I apologize, there was an issue saving your card details. Please try again."
 
     async def _save_payment_details(
         self,
