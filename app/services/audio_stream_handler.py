@@ -76,6 +76,7 @@ class AudioStreamHandler:
         self.hangup_after_audio = False
         self.callback_in_progress = False
         self.barge_in_occurred = False  # ✅ Flag to stop remaining sentences after interruption
+        self.last_barge_in_time = 0.0   # Timestamp of last barge-in — used for post-barge-in grace period
         self.conversation_history = []
         self.max_history_messages = 10
         self.current_voice_id = None
@@ -167,8 +168,8 @@ class AudioStreamHandler:
             "reach me at", "ring me back", "give me a call"
         ]
 
-        # ✅ FIX: Hangup / end-call detection patterns
-        # When customer says these, we MUST hang up immediately — no sales pitch!
+        # Hangup phrases — kept for reference but NOT used to auto-hangup.
+        # Agent is instructed to re-engage the customer instead of ending the call.
         self.HANGUP_PATTERNS = [
             "hang up", "hangup", "end the call", "end call", "stop the call",
             "please hang up", "please end", "cut the call", "disconnect",
@@ -559,12 +560,22 @@ class AudioStreamHandler:
                         print(f"⚠️ [FIRST-UTTERANCE] User spoke before greeting played: '{sentence}'")
                         self.has_greeted = True
 
-                    if self.is_speaking and len(sentence) > 2:
-                        print(f"🛑 [BARGE-IN] User interrupted AI ({'final' if is_final else 'interim'}): '{sentence}'")
+                    # ── Barge-in detection ──────────────────────────────────────
+                    # Final results: stop AI on any meaningful content (>3 chars).
+                    # Interim results: require 3+ words so that brief noise / filler
+                    # words ("uh", "oh", "hmm") don't prematurely kill the AI response.
+                    barge_in_words = len(sentence.split())
+                    should_barge_in = (
+                        (is_final and len(sentence) > 3) or
+                        (not is_final and barge_in_words >= 3)
+                    )
+                    if self.is_speaking and should_barge_in:
+                        print(f"🛑 [BARGE-IN] User interrupted AI ({'final' if is_final else f'interim/{barge_in_words}w'}): '{sentence}'")
                         if self.tts_task and not self.tts_task.done():
                             self.tts_task.cancel()
                         self.is_speaking = False
                         self.barge_in_occurred = True
+                        self.last_barge_in_time = time.time()
 
                     if is_final:
                         print(f"📝 [TRANSCRIPT] '{sentence}'")
@@ -720,15 +731,22 @@ class AudioStreamHandler:
                         buffer_text = " ".join(transcript_buffer).lower()
                         has_callback_keyword = any(phrase in buffer_text for phrase in ["call me", "call back", "callback", "call later"])
 
-                        # ✅ Use a longer silence timeout during card number dictation.
-                        # Users pause between groups of digits ("one two three four" …pause… "five six"),
-                        # so 0.5 s fires too early and cuts off mid-number.
+                        # ── Dynamic silence timeout ──────────────────────────
+                        # Card number dictation: 2.0s — digits come in groups with pauses.
+                        # Other payment steps: 1.2s — names/dates need a moment.
+                        # Post-barge-in grace: 1.5s — after interruption give user time
+                        #   to finish their full thought before responding.
+                        # Default: 0.5s for normal conversation flow.
                         payment_state = self.agent_executor.active_payments.get(call_id, {})
                         payment_step = payment_state.get("step", "")
+                        time_since_barge_in = time.time() - self.last_barge_in_time
+                        barge_in_recently = time_since_barge_in < 3.0  # grace window: 3s after barge-in
                         if payment_step == "card_number":
                             timeout = 2.0   # 16 digits take time — wait for a real pause
                         elif payment_step in ("cardholder_name", "expiry", "cvc", "bank_name", "phone_number", "address", "confirm"):
                             timeout = 1.2   # Slightly longer for other payment inputs
+                        elif barge_in_recently:
+                            timeout = 1.5   # Post-barge-in: let user finish their sentence
                         elif has_callback_keyword:
                             timeout = CALLBACK_SILENCE_TIMEOUT
                         else:
@@ -1091,15 +1109,46 @@ class AudioStreamHandler:
             print(f"🚫 [HANGUP-IN-PROGRESS] Ignoring input, hangup already triggered")
             return
 
-        # ✅ Only one utterance should be processed at a time.
-        # If the lock is already held (previous utterance still generating/playing),
-        # discard this one to avoid overlapping audio.
+        # ── Utterance serialisation ──────────────────────────────────────────
+        # Only one utterance should be processed at a time to avoid overlapping
+        # audio.  There are two cases when we arrive here while the lock is held:
+        #
+        # 1. Normal overlap (AI is mid-response, user spoke but we are not done):
+        #    Discard — the current AI response is still valid.
+        #
+        # 2. Post-barge-in overlap: user interrupted the AI (barge_in_occurred=True),
+        #    the old streaming task is still cleaning up (cancelling TTS, breaking out
+        #    of the stream loop).  We MUST NOT discard — this IS the user's actual new
+        #    utterance.  Wait up to 3 s for the cleanup to finish, then process.
         if self._utterance_lock.locked():
-            print(f"🚫 [UTTERANCE-LOCK] Already processing an utterance, discarding: '{text[:50]}'")
+            if self.barge_in_occurred:
+                print(f"⏳ [BARGE-IN-WAIT] Previous response aborting, waiting to process: '{text[:50]}'")
+                try:
+                    # Wait for the aborting task to release the lock (should be <1s)
+                    await asyncio.wait_for(self._utterance_lock.acquire(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    print(f"⚠️ [BARGE-IN-WAIT] Lock not released after 3s — discarding utterance")
+                    return
+                # We now own the lock manually — process then release in finally
+                try:
+                    if self.tts_task and not self.tts_task.done():
+                        self.tts_task.cancel()
+                        try:
+                            await self.tts_task
+                        except asyncio.CancelledError:
+                            pass
+                        self.is_speaking = False
+                    await self._process_user_utterance_inner(
+                        text, websocket, call_sid, agent_config, user_id, call_id, db, stream_sid
+                    )
+                finally:
+                    self._utterance_lock.release()
+            else:
+                print(f"🚫 [UTTERANCE-LOCK] Already processing an utterance, discarding: '{text[:50]}'")
             return
 
         async with self._utterance_lock:
-            # ✅ Cancel any TTS that is still playing from the previous turn
+            # Cancel any TTS still playing from the previous turn
             if self.tts_task and not self.tts_task.done():
                 print(f"🛑 [TTS-CANCEL] Cancelling previous TTS before new response")
                 self.tts_task.cancel()
@@ -1153,32 +1202,13 @@ class AudioStreamHandler:
             if should_recheck and len(text.split()) >= 2:
                 await self._recheck_language(text)
 
-        # ✅ PRIORITY -1: Detect hangup / busy intent — end call immediately, NO sales pitch
-        wants_hangup = any(phrase in text_lower for phrase in self.HANGUP_PATTERNS)
-        if wants_hangup:
-            print(f"📞 [HANGUP-INTENT] Customer wants to end call: '{text}'")
-            self.callback_in_progress = True  # Block further processing
-
-            goodbye_msg = "It was nice speaking with you, have a great day!"
-            print(f"🔊 [HANGUP] Playing goodbye: '{goodbye_msg}'")
-            audio_duration = await self.stream_elevenlabs_audio(goodbye_msg, websocket, stream_sid)
-
-            buffer_time = 1.0
-            total_wait = audio_duration + buffer_time
-            print(f"⏳ [HANGUP] Waiting {total_wait:.2f}s for audio to finish...")
-            await asyncio.sleep(total_wait)
-
-            # Store transcript
-            await self.store_transcript(db, call_id, call_sid, text, goodbye_msg)
-
-            print(f"📞 [HANGUP] Hanging up call {call_sid}...")
-            hangup_result = twilio_service.hangup_call(call_sid)
-            if hangup_result.get("success"):
-                print(f"✅ [HANGUP] Call ended successfully")
-            else:
-                print(f"⚠️ [HANGUP] Hangup API failed: {hangup_result.get('error')} — setting flag")
-                self.should_hangup = True
-            return
+        # NOTE: Auto-hangup on customer exit phrases is intentionally disabled.
+        # The agent handles objections and re-engages the customer instead of ending the call.
+        # If the customer says "hang up" / "bye" / "not interested", the AI will respond
+        # with a re-engagement pivot — the call only ends via silence timeout or callback.
+        if any(phrase in text_lower for phrase in self.HANGUP_PATTERNS):
+            print(f"🔄 [RETENTION] Customer exit phrase detected — letting AI re-engage: '{text[:60]}'")
+            # Fall through to normal AI response (do NOT return or hang up)
 
         # ✅ PRIORITY -1b: If customer says "call me later" that also implies busy — schedule callback
         # (handled below via CALLBACK_PATTERNS)

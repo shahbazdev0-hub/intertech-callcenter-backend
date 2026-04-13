@@ -404,6 +404,36 @@ class AgentExecutor:
             has_active_payment = call_id in self.active_payments
             wants_to_pay = any(phrase in user_input_lower for phrase in self.PAYMENT_INTENT_PHRASES)
 
+            # ── Context-aware affirmative detection ──────────────────────────
+            # When the AI just asked the enrollment/payment question and the user
+            # replies with a simple affirmative ("yes", "sure", "okay", etc.),
+            # treat it as payment intent so the state machine kicks in instead of
+            # the LLM generating a manual card-collection response.
+            if not wants_to_pay and not has_active_payment:
+                _simple_affirmatives = {
+                    "yes", "yeah", "yep", "yup", "sure", "okay", "ok", "alright",
+                    "all right", "go ahead", "let's do it", "sounds good", "fine",
+                    "please", "yes please", "absolutely", "of course", "definitely",
+                    "sure thing", "let's go", "do it", "proceed", "ready",
+                }
+                # Strip punctuation for a clean comparison
+                stripped_input = user_input_lower.strip().rstrip("?.!, ")
+                if stripped_input in _simple_affirmatives:
+                    # Check if the last AI message was about payment / enrollment
+                    _enrollment_keywords = [
+                        "card details", "collect your", "get your details",
+                        "lock in", "promotional rate", "monthly rate", "89",
+                        "enrollment", "reserve your spot", "payment details",
+                        "card information", "secure your spot",
+                    ]
+                    last_ai_msg = next(
+                        (m["content"].lower() for m in reversed(history) if m.get("role") == "assistant"),
+                        ""
+                    )
+                    if any(kw in last_ai_msg for kw in _enrollment_keywords):
+                        logger.info(f"💳 [CONTEXT-AFFIRMATIVE] Affirmative after enrollment pitch — triggering payment")
+                        wants_to_pay = True
+
             if has_active_payment or wants_to_pay:
                 logger.info(f"💳 PRIORITY 1.5: {'Continuing' if has_active_payment else 'Starting'} payment collection...")
                 payment_response = await self._handle_payment_collection(
