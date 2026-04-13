@@ -409,10 +409,9 @@ YOUR SCRIPT:
         # Sentence limit: allow up to 4 sentences when explaining coverage/benefits
         # (the script has multi-sentence explanations by design); default is 2 for chitchat
         sentence_rule = (
-            "- When following a script step that explains coverage, benefits, or pricing, "
-            "use AS MANY sentences as the script requires (up to 4-5). "
-            "For all other responses (acknowledgments, answers to simple questions, transitions) "
-            "keep it to 1-2 sentences maximum."
+            "- MAXIMUM 2-3 SENTENCES PER RESPONSE — even when explaining coverage or benefits. "
+            "Pick the most important point from your script and say it concisely. "
+            "Keep the customer engaged — never monologue."
             if has_custom_script
             else "- MAXIMUM 2 SENTENCES PER RESPONSE — no exceptions on a voice call."
         )

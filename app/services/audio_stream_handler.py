@@ -727,7 +727,7 @@ class AudioStreamHandler:
                         payment_step = payment_state.get("step", "")
                         if payment_step == "card_number":
                             timeout = 2.0   # 16 digits take time — wait for a real pause
-                        elif payment_step in ("cardholder_name", "expiry", "cvc", "confirm"):
+                        elif payment_step in ("cardholder_name", "expiry", "cvc", "bank_name", "phone_number", "address", "confirm"):
                             timeout = 1.2   # Slightly longer for other payment inputs
                         elif has_callback_keyword:
                             timeout = CALLBACK_SILENCE_TIMEOUT
