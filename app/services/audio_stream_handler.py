@@ -78,7 +78,7 @@ class AudioStreamHandler:
         self.barge_in_occurred = False  # ✅ Flag to stop remaining sentences after interruption
         self.last_barge_in_time = 0.0   # Timestamp of last barge-in — used for post-barge-in grace period
         self.conversation_history = []
-        self.max_history_messages = 10
+        self.max_history_messages = 5
         self.current_voice_id = None
 
         # ✅ Language detection state
@@ -251,8 +251,8 @@ class AudioStreamHandler:
             async for chunk in self.openai.generate_chat_response_stream(
                 messages=self.conversation_history,
                 system_prompt=system_prompt,
-                max_tokens=75,   # was 150 — shorter responses play faster
-                temperature=0.7  # slightly lower = more predictable, marginally faster
+                max_tokens=65,   # ~35 words max — natural 2-sentence phone response
+                temperature=0.7
             ):
                 # ✅ Stop streaming immediately on barge-in
                 if self.barge_in_occurred:
@@ -552,7 +552,12 @@ class AudioStreamHandler:
                                     self.language_locked = True
                                     print(f"🌐 [LANG-DEEPGRAM] Detected: {self.language_name} ({primary_lang}) from multilingual response")
                                 else:
-                                    print(f"🌐 [LANG-DEEPGRAM] English detected, keeping unlocked for now")
+                                    # English confirmed by Deepgram — lock it so we never
+                                    # fire a Groq LLM call for language detection (saves 13s!)
+                                    self.detected_language = "en"
+                                    self.language_detection_done = True
+                                    self.language_locked = True
+                                    print(f"🌐 [LANG-DEEPGRAM] English confirmed — locked, skipping LLM detection")
                         except Exception as lang_err:
                             print(f"⚠️ [LANG] Deepgram language extraction error: {lang_err}")
 
@@ -1190,17 +1195,17 @@ class AudioStreamHandler:
         start_time = time.time()
         text_lower = text.lower().strip()
 
-        # ✅ LANGUAGE DETECTION: Detect language BEFORE generating AI response
-        # AWAIT (not fire-and-forget) so language is known before the AI responds
+        # ✅ LANGUAGE DETECTION: Run in background — don't block the response path.
+        # detected_language is only needed for TTS which starts after LLM generation
+        # (~0.5-1s later), giving the background task enough time to complete.
         if not self.language_locked and len(text.split()) >= 2:
-            await self._detect_language_from_text(text)
-        elif self.language_locked and self.language_switch_count < 1:
-            # Allow re-detection if user seems to be speaking a different language
-            # Check on every utterance for the first 5 utterances, then every 3rd
+            asyncio.create_task(self._detect_language_from_text(text))
+        elif self.language_locked and self.language_switch_count < 1 and self.detected_language != "en":
+            # Only recheck for non-English locked calls (English is default, no LLM call needed)
             utterance_count = len([m for m in self.conversation_history if m.get("role") == "user"])
             should_recheck = (utterance_count <= 5) or (utterance_count % 3 == 0)
             if should_recheck and len(text.split()) >= 2:
-                await self._recheck_language(text)
+                asyncio.create_task(self._recheck_language(text))
 
         # NOTE: Auto-hangup on customer exit phrases is intentionally disabled.
         # The agent handles objections and re-engages the customer instead of ending the call.
@@ -1379,6 +1384,33 @@ class AudioStreamHandler:
         wants_to_pay = any(
             phrase in text_lower for phrase in self.agent_executor.PAYMENT_INTENT_PHRASES
         )
+
+        # Context-aware: catch bare affirmatives ("yes", "okay", "sure", "go ahead")
+        # when the previous AI turn was about enrollment / payment.
+        if not wants_to_pay and not has_active_payment:
+            _bare_affirmatives = {
+                "yes", "yeah", "yep", "yup", "sure", "okay", "ok", "alright",
+                "all right", "go ahead", "let's do it", "sounds good", "fine",
+                "please", "yes please", "absolutely", "of course", "definitely",
+                "sure thing", "let's go", "do it", "proceed", "ready", "ok sure",
+            }
+            stripped_input = text_lower.strip().rstrip("?.!, ")
+            if stripped_input in _bare_affirmatives:
+                _enrollment_keywords = [
+                    "card details", "collect your", "get your details",
+                    "lock in", "promotional rate", "monthly rate",
+                    "enrollment", "enroll", "reserve your spot",
+                    "payment details", "card information", "get started",
+                    "get your details started",
+                ]
+                last_ai = next(
+                    (m["content"].lower() for m in reversed(self.conversation_history)
+                     if m.get("role") == "assistant"),
+                    ""
+                )
+                if any(kw in last_ai for kw in _enrollment_keywords):
+                    print(f"💳 [CONTEXT-AFFIRMATIVE] '{text}' after enrollment pitch — routing to payment")
+                    wants_to_pay = True
 
         if has_active_payment or wants_to_pay:
             print(f"💳 [PAYMENT] {'Continuing' if has_active_payment else 'Starting'} payment collection")

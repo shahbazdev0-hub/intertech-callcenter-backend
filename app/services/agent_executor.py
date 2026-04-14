@@ -187,6 +187,9 @@ class AgentExecutor:
             "i want it", "i'll take that", "i want to confirm",
             "yes i want to buy", "yes i want the service",
             "i want to confirm my order", "confirm my booking",
+            # ── Short affirmatives (standalone — handled by context check too) ─
+            "go ahead", "yeah go ahead", "sure go ahead", "yes go ahead",
+            "sounds good", "let's do it", "yes let's do it",
         ]
 
         logger.info("✅ AgentExecutor initialized with FAST CONTEXTUAL RESPONSE + SALES FOCUS system")
