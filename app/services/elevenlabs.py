@@ -330,6 +330,63 @@ class ElevenLabsService:
         
         return shaped
 
+    async def text_to_speech_stream_twilio(
+        self,
+        text: str,
+        voice_id: Optional[str] = None,
+        language_code: Optional[str] = None
+    ):
+        """
+        🚀 LOW-LATENCY streaming TTS for Twilio.
+        Uses ElevenLabs /stream endpoint with ulaw_8000 output so the first
+        audio chunk reaches the caller in ~200 ms instead of waiting 2-3 s
+        for the complete audio file.
+
+        Yields raw ulaw bytes in chunks — caller is responsible for sending
+        to Twilio and checking barge-in between chunks.
+        """
+        voice_id = voice_id or self.default_voice_id
+        # optimize_streaming_latency=4 is the most aggressive ElevenLabs setting
+        url = (
+            f"{self.base_url}/text-to-speech/{voice_id}/stream"
+            f"?output_format=ulaw_8000&optimize_streaming_latency=4"
+        )
+
+        headers = {
+            "Accept": "audio/basic",          # ulaw MIME type
+            "Content-Type": "application/json",
+            "xi-api-key": self.api_key,
+        }
+
+        data = {
+            "text": text,
+            "model_id": self.model_id,        # eleven_flash_v2_5
+            "voice_settings": {
+                "stability": 0.45,
+                "similarity_boost": 0.80,
+                "style": 0.10,
+                "use_speaker_boost": True,
+            },
+        }
+        if language_code and language_code != "en":
+            data["language_code"] = language_code
+
+        # Generous total timeout (streaming can last several seconds for longer texts)
+        timeout = aiohttp.ClientTimeout(total=10, connect=1.5)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=data, headers=headers) as response:
+                    if response.status == 200:
+                        # Stream in 320-byte increments (40 ms of ulaw at 8 kHz)
+                        async for chunk in response.content.iter_chunked(320):
+                            if chunk:
+                                yield chunk
+                    else:
+                        error = await response.text()
+                        print(f"❌ [EL-STREAM] Error {response.status}: {error}")
+        except Exception as e:
+            print(f"❌ [EL-STREAM] Exception: {e}")
+
     async def stream_audio(self, text: str, voice_id: Optional[str] = None):
         """
         🎵 Stream audio from ElevenLabs in real-time

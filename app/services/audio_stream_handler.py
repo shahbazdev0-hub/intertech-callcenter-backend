@@ -251,8 +251,8 @@ class AudioStreamHandler:
             async for chunk in self.openai.generate_chat_response_stream(
                 messages=self.conversation_history,
                 system_prompt=system_prompt,
-                max_tokens=150,
-                temperature=0.8
+                max_tokens=75,   # was 150 — shorter responses play faster
+                temperature=0.7  # slightly lower = more predictable, marginally faster
             ):
                 # ✅ Stop streaming immediately on barge-in
                 if self.barge_in_occurred:
@@ -653,8 +653,8 @@ class AudioStreamHandler:
             async def check_silence():
                 nonlocal last_speech_time, transcript_buffer, first_user_speech_received
 
-                SILENCE_TIMEOUT = 0.5
-                CALLBACK_SILENCE_TIMEOUT = 0.8
+                SILENCE_TIMEOUT = 0.4          # reduced from 0.5 — saves 100ms per turn
+                CALLBACK_SILENCE_TIMEOUT = 0.7
 
                 while True:
                     await asyncio.sleep(0.3)
@@ -1949,50 +1949,86 @@ Return ONLY the email address, nothing else. If no valid email can be extracted,
 
     async def stream_elevenlabs_audio(self, text: str, websocket, stream_sid: str) -> float:
         """
-        Generate and stream audio to Twilio - WITH BARGE-IN SUPPORT
-        ✅ FIX: Uses self.current_voice_id so greeting voice MATCHES conversation voice.
-        Returns: Audio duration in seconds
+        🚀 LOW-LATENCY streaming TTS → Twilio.
+
+        Pipes ElevenLabs audio chunks directly to Twilio as they arrive.
+        First audio byte reaches the caller in ~200 ms instead of waiting
+        2-3 s for the complete audio file.
+
+        Returns the total audio duration in seconds.
         """
-        # ✅ BARGE-IN: Skip TTS entirely if user already interrupted
         if self.barge_in_occurred:
-            print(f"🛑 [TTS-SKIPPED] Barge-in active, skipping TTS for: '{text[:80]}...'")
+            print(f"🛑 [TTS-SKIPPED] Barge-in active, skipping: '{text[:60]}'")
             return 0.0
 
-        print(f"🔊 [TTS-START] Generating audio for: '{text[:500]}...'")
+        print(f"🔊 [TTS-STREAM] Starting for: '{text[:80]}'")
         self.is_speaking = True
         start_time = time.time()
-        audio_duration = 0.0
+        total_bytes = 0
+        chunk_size = 320          # 40 ms of ulaw at 8 kHz
+        buffer = b""
+        first_chunk_logged = False
 
         try:
-            # ✅ FIX: Always pass the stored voice_id so every TTS call uses the SAME voice
-            # ✅ MULTILINGUAL: Pass detected language code for better non-English TTS
-            mulaw_data = await self.elevenlabs.text_to_speech_for_twilio(
+            async for raw_chunk in self.elevenlabs.text_to_speech_stream_twilio(
                 text,
                 voice_id=self.current_voice_id,
-                language_code=self.detected_language if self.detected_language != "en" else None
-            )
+                language_code=self.detected_language if self.detected_language != "en" else None,
+            ):
+                # ── Barge-in check ───────────────────────────────────────
+                if not self.is_speaking:
+                    try:
+                        await websocket.send_text(json.dumps({
+                            "event": "clear",
+                            "streamSid": stream_sid,
+                        }))
+                    except Exception:
+                        pass
+                    print(f"🛑 [TTS-STREAM] Barge-in mid-stream — stopped + cleared buffer")
+                    break
 
-            if mulaw_data:
-                # ✅ Calculate actual audio duration
-                audio_duration = len(mulaw_data) / 8000.0  # 8kHz sample rate
-                
-                print(f"✅ [TTS] Got {len(mulaw_data)} bytes ({audio_duration:.2f}s duration)")
-                await self.send_mulaw_audio(mulaw_data, websocket, stream_sid)
+                buffer += raw_chunk
 
-                print(f"📤 [SENT] Audio sent ({audio_duration:.2f}s duration), ready for barge-in")
-            else:
-                print(f"❌ [TTS] Failed to generate audio")
+                # Send every complete 320-byte chunk immediately
+                while len(buffer) >= chunk_size:
+                    audio_chunk = buffer[:chunk_size]
+                    buffer = buffer[chunk_size:]
+
+                    payload = base64.b64encode(audio_chunk).decode("utf-8")
+                    await websocket.send_text(json.dumps({
+                        "event": "media",
+                        "streamSid": stream_sid,
+                        "media": {"payload": payload},
+                    }))
+                    total_bytes += chunk_size
+
+                    if not first_chunk_logged:
+                        first_chunk_logged = True
+                        print(f"⚡ [TTS-STREAM] First chunk sent in {(time.time()-start_time)*1000:.0f} ms")
+
+            # Flush any remaining bytes (pad to 320 with silence)
+            if buffer and self.is_speaking:
+                if len(buffer) % chunk_size:
+                    buffer += b"\xff" * (chunk_size - len(buffer) % chunk_size)
+                payload = base64.b64encode(buffer).decode("utf-8")
+                await websocket.send_text(json.dumps({
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {"payload": payload},
+                }))
+                total_bytes += len(buffer)
 
         except asyncio.CancelledError:
-            print("🛑 [TTS] Cancelled (barge-in detected)")
+            print("🛑 [TTS-STREAM] Cancelled (barge-in)")
             raise
         except Exception as e:
-            print(f"❌ [TTS-ERROR] {e}")
+            print(f"❌ [TTS-STREAM-ERROR] {e}")
         finally:
-            tts_time = time.time() - start_time
             self.is_speaking = False
-            print(f"✅ [TTS] Completed in {tts_time:.2f}s")
-        
+
+        audio_duration = total_bytes / 8000.0
+        elapsed = time.time() - start_time
+        print(f"✅ [TTS-STREAM] {total_bytes} bytes ({audio_duration:.2f}s audio) in {elapsed:.2f}s wall-time")
         return audio_duration
 
     async def store_transcript(self, db, call_id, call_sid, user_text, agent_text):
