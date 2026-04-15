@@ -580,12 +580,12 @@ class AudioStreamHandler:
                         self.has_greeted = True
 
                     # ── Barge-in detection ──────────────────────────────────────
-                    # Final results: stop AI on any meaningful content (>3 chars).
-                    # Interim results: require 3+ words so that brief noise / filler
-                    # words ("uh", "oh", "hmm") don't prematurely kill the AI response.
+                    # Both final and interim require 2+ words so single filler words
+                    # ("uh", "yeah", "ok", "sure") don't cut off the AI mid-sentence.
+                    # Interim requires 3+ words (less reliable transcription).
                     barge_in_words = len(sentence.split())
                     should_barge_in = (
-                        (is_final and len(sentence) > 3) or
+                        (is_final and barge_in_words >= 2) or
                         (not is_final and barge_in_words >= 3)
                     )
                     if self.is_speaking and should_barge_in:
@@ -1519,20 +1519,28 @@ class AudioStreamHandler:
         print(f"💭 [CACHE MISS] Generating streaming response...")
 
         try:
-            # ✅ NEW: Use the enhanced streaming response with conversation memory
-            ai_response = await self.generate_streaming_response(
-                user_input=text,
-                agent_config=agent_config,
-                user_id=user_id,
-                call_id=call_id,
-                db=db,
-                call_sid=call_sid,
-                websocket=websocket,
-                stream_sid=stream_sid
+            # Wrap in a task so barge-in can cancel it instantly (releases utterance lock)
+            self.response_task = asyncio.create_task(
+                self.generate_streaming_response(
+                    user_input=text,
+                    agent_config=agent_config,
+                    user_id=user_id,
+                    call_id=call_id,
+                    db=db,
+                    call_sid=call_sid,
+                    websocket=websocket,
+                    stream_sid=stream_sid
+                )
             )
+            ai_response = await self.response_task
 
             # ✅ Store transcript (generate_streaming_response already played the audio)
             await self.store_transcript(db, call_id, call_sid, text, ai_response)
+
+        except asyncio.CancelledError:
+            print(f"🛑 [RESPONSE-CANCELLED] LLM stream cancelled by barge-in — lock released")
+            self.response_task = None
+            return
 
         except Exception as e:
             print(f"❌ [AI-ERROR] {e}")
@@ -2036,7 +2044,14 @@ Return ONLY the email address, nothing else. If no valid email can be extracted,
                 print(f"❌ [TTS] Failed to generate audio")
 
         except asyncio.CancelledError:
-            print("🛑 [TTS] Cancelled (barge-in detected)")
+            print("🛑 [TTS] Cancelled — flushing Twilio buffer")
+            try:
+                await asyncio.shield(websocket.send_text(json.dumps({
+                    "event": "clear",
+                    "streamSid": stream_sid,
+                })))
+            except (asyncio.CancelledError, Exception):
+                pass
             raise
         except Exception as e:
             print(f"❌ [TTS-ERROR] {e}")
