@@ -72,6 +72,7 @@ class AudioStreamHandler:
         self.has_greeted = False
         self.greeting_done = asyncio.Event()  # Signals when greeting has finished playing
         self.tts_task = None
+        self.response_task = None       # LLM streaming task — cancelled on barge-in to release lock instantly
         self.should_hangup = False  # ✅ Flag to signal hangup after callback
         self.hangup_after_audio = False
         self.callback_in_progress = False
@@ -248,79 +249,92 @@ class AudioStreamHandler:
 
             print(f"🚀 STREAMING chat response with {self.openai.provider} ({self.openai.model})")
 
-            async for chunk in self.openai.generate_chat_response_stream(
-                messages=self.conversation_history,
-                system_prompt=system_prompt,
-                max_tokens=65,   # ~35 words max — natural 2-sentence phone response
-                temperature=0.7
-            ):
-                # ✅ Stop streaming immediately on barge-in
-                if self.barge_in_occurred:
-                    print(f"🛑 [STREAM-ABORT] Barge-in detected, stopping streaming")
-                    await tts_queue.put(None)  # Signal player to stop
-                    break
+            try:
+                async for chunk in self.openai.generate_chat_response_stream(
+                    messages=self.conversation_history,
+                    system_prompt=system_prompt,
+                    max_tokens=65,   # ~35 words max — natural 2-sentence phone response
+                    temperature=0.7
+                ):
+                    # ✅ Stop streaming immediately on barge-in
+                    if self.barge_in_occurred:
+                        print(f"🛑 [STREAM-ABORT] Barge-in detected, stopping streaming")
+                        await tts_queue.put(None)  # Signal player to stop
+                        break
 
-                if chunk.get("error"):
-                    error_msg = chunk['error']
-                    print(f"❌ Streaming error: {error_msg}")
-                    had_error = True
+                    if chunk.get("error"):
+                        error_msg = chunk['error']
+                        print(f"❌ Streaming error: {error_msg}")
+                        had_error = True
 
-                    if "429" in str(error_msg) or "rate_limit" in str(error_msg).lower():
-                        fallback = "I appreciate you answering! We're experiencing high volume right now. I'll call you back in 10 minutes. Have a great day!"
-                        await tts_queue.put(fallback)
-                        await tts_queue.put(None)
-                        await playback_done.wait()
+                        if "429" in str(error_msg) or "rate_limit" in str(error_msg).lower():
+                            fallback = "I appreciate you answering! We're experiencing high volume right now. I'll call you back in 10 minutes. Have a great day!"
+                            await tts_queue.put(fallback)
+                            await tts_queue.put(None)
+                            await playback_done.wait()
 
-                        wait_time = len(fallback.split()) * 0.4 + 1.0
-                        await asyncio.sleep(wait_time)
-                        from app.services.twilio import twilio_service
-                        twilio_service.hangup_call(call_sid)
-                        full_response = fallback
-                    else:
-                        fallback = "I'm sorry, could you repeat that?"
-                        await tts_queue.put(fallback)
-                        await tts_queue.put(None)
-                        full_response = fallback
-                    break
+                            wait_time = len(fallback.split()) * 0.4 + 1.0
+                            await asyncio.sleep(wait_time)
+                            from app.services.twilio import twilio_service
+                            twilio_service.hangup_call(call_sid)
+                            full_response = fallback
+                        else:
+                            fallback = "I'm sorry, could you repeat that?"
+                            await tts_queue.put(fallback)
+                            await tts_queue.put(None)
+                            full_response = fallback
+                        break
 
-                if chunk.get("done"):
-                    # Flush any remaining buffer as final fragment
-                    if sentence_buffer.strip() and len(sentence_buffer.strip()) > 5:
-                        sentence_count += 1
-                        print(f"🎵 [FINAL-FRAGMENT] '{sentence_buffer.strip()}'")
-                        await tts_queue.put(sentence_buffer.strip())
-                    await tts_queue.put(None)  # Signal end of sentences
-                    break
+                    if chunk.get("done"):
+                        # Flush any remaining buffer as final fragment
+                        if sentence_buffer.strip() and len(sentence_buffer.strip()) > 5:
+                            sentence_count += 1
+                            print(f"🎵 [FINAL-FRAGMENT] '{sentence_buffer.strip()}'")
+                            await tts_queue.put(sentence_buffer.strip())
+                        await tts_queue.put(None)  # Signal end of sentences
+                        break
 
-                token = chunk.get("token", "")
-                if not token:
-                    continue
+                    token = chunk.get("token", "")
+                    if not token:
+                        continue
 
-                full_response += token
-                sentence_buffer += token
+                    full_response += token
+                    sentence_buffer += token
 
-                # ✅ Detect sentence boundary and immediately queue for TTS
-                # Don't wait — queue it and keep streaming
-                if token in '.!?' or sentence_buffer.endswith(('? ', '. ', '! ')):
-                    sentence = sentence_buffer.strip()
-                    if len(sentence) > 10:
-                        sentence_count += 1
-                        elapsed = time.time() - start_time
-                        print(f"🎵 [SENTENCE-{sentence_count}] '{sentence}' (after {elapsed:.2f}s)")
-                        await tts_queue.put(sentence)  # ✅ Non-blocking — player handles it
-                        sentence_buffer = ""
+                    # ✅ Detect sentence boundary and immediately queue for TTS
+                    # Hard cap at 2 sentences — any more and the turn is too long
+                    if token in '.!?' or sentence_buffer.endswith(('? ', '. ', '! ')):
+                        sentence = sentence_buffer.strip()
+                        if len(sentence) > 10:
+                            sentence_count += 1
+                            elapsed = time.time() - start_time
+                            print(f"🎵 [SENTENCE-{sentence_count}] '{sentence}' (after {elapsed:.2f}s)")
+                            await tts_queue.put(sentence)
+                            sentence_buffer = ""
+                            if sentence_count >= 2:
+                                # Stop streaming — 2 sentences is the max per turn
+                                await tts_queue.put(None)
+                                full_response = full_response.strip()
+                                break
 
-            # Wait for all audio to finish playing
-            if not self.barge_in_occurred:
-                await playback_done.wait()
+                # Wait for all audio to finish playing
+                if not self.barge_in_occurred:
+                    await playback_done.wait()
 
-            # Ensure player task is cleaned up
-            if not player_task.done():
-                player_task.cancel()
-                try:
-                    await player_task
-                except asyncio.CancelledError:
-                    pass
+            except asyncio.CancelledError:
+                # Barge-in cancelled this task mid-Groq-stream — stop TTS and exit cleanly
+                print(f"🛑 [STREAM-CANCELLED] Groq stream cancelled by barge-in")
+                await tts_queue.put(None)  # stop the player
+                raise  # re-raise so the task is properly marked cancelled
+
+            finally:
+                # Always clean up the player task regardless of how we exit
+                if not player_task.done():
+                    player_task.cancel()
+                    try:
+                        await asyncio.shield(player_task)
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
             total_time = time.time() - start_time
             print(f"⏱️ [LLM-STREAM] Completed in {total_time:.2f}s ({sentence_count} sentences)")
@@ -576,8 +590,14 @@ class AudioStreamHandler:
                     )
                     if self.is_speaking and should_barge_in:
                         print(f"🛑 [BARGE-IN] User interrupted AI ({'final' if is_final else f'interim/{barge_in_words}w'}): '{sentence}'")
+                        # Cancel TTS audio delivery
                         if self.tts_task and not self.tts_task.done():
                             self.tts_task.cancel()
+                        # Cancel LLM streaming task — this releases the utterance lock immediately
+                        # even if Groq hasn't sent the first token yet (the main source of lock-hold)
+                        if self.response_task and not self.response_task.done():
+                            self.response_task.cancel()
+                            print(f"🛑 [BARGE-IN] Cancelled LLM streaming — lock will release immediately")
                         self.is_speaking = False
                         self.barge_in_occurred = True
                         self.last_barge_in_time = time.time()
@@ -658,11 +678,11 @@ class AudioStreamHandler:
             async def check_silence():
                 nonlocal last_speech_time, transcript_buffer, first_user_speech_received
 
-                SILENCE_TIMEOUT = 0.4          # reduced from 0.5 — saves 100ms per turn
+                SILENCE_TIMEOUT = 0.4          # normal turn — fast response
                 CALLBACK_SILENCE_TIMEOUT = 0.7
 
                 while True:
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.1)   # poll every 100ms (was 300ms) — up to 200ms faster per turn
                     if self.should_hangup:
                         print(f"📞 [SILENCE-CHECK] Hangup flag detected, stopping silence checker")
                         break
@@ -745,13 +765,13 @@ class AudioStreamHandler:
                         payment_state = self.agent_executor.active_payments.get(call_id, {})
                         payment_step = payment_state.get("step", "")
                         time_since_barge_in = time.time() - self.last_barge_in_time
-                        barge_in_recently = time_since_barge_in < 3.0  # grace window: 3s after barge-in
+                        barge_in_recently = time_since_barge_in < 1.5  # grace window: 1.5s after barge-in
                         if payment_step == "card_number":
                             timeout = 2.0   # 16 digits take time — wait for a real pause
                         elif payment_step in ("cardholder_name", "expiry", "cvc", "bank_name", "phone_number", "address", "confirm"):
                             timeout = 1.2   # Slightly longer for other payment inputs
                         elif barge_in_recently:
-                            timeout = 1.5   # Post-barge-in: let user finish their sentence
+                            timeout = 0.7   # Post-barge-in grace: reduced from 1.5s to save 0.8s latency
                         elif has_callback_keyword:
                             timeout = CALLBACK_SILENCE_TIMEOUT
                         else:
@@ -1981,86 +2001,50 @@ Return ONLY the email address, nothing else. If no valid email can be extracted,
 
     async def stream_elevenlabs_audio(self, text: str, websocket, stream_sid: str) -> float:
         """
-        🚀 LOW-LATENCY streaming TTS → Twilio.
-
-        Pipes ElevenLabs audio chunks directly to Twilio as they arrive.
-        First audio byte reaches the caller in ~200 ms instead of waiting
-        2-3 s for the complete audio file.
-
-        Returns the total audio duration in seconds.
+        Generate and stream audio to Twilio - WITH BARGE-IN SUPPORT
+        ✅ FIX: Uses self.current_voice_id so greeting voice MATCHES conversation voice.
+        Returns: Audio duration in seconds
         """
+        # ✅ BARGE-IN: Skip TTS entirely if user already interrupted
         if self.barge_in_occurred:
-            print(f"🛑 [TTS-SKIPPED] Barge-in active, skipping: '{text[:60]}'")
+            print(f"🛑 [TTS-SKIPPED] Barge-in active, skipping TTS for: '{text[:80]}...'")
             return 0.0
 
-        print(f"🔊 [TTS-STREAM] Starting for: '{text[:80]}'")
+        print(f"🔊 [TTS-START] Generating audio for: '{text[:500]}...'")
         self.is_speaking = True
         start_time = time.time()
-        total_bytes = 0
-        chunk_size = 320          # 40 ms of ulaw at 8 kHz
-        buffer = b""
-        first_chunk_logged = False
+        audio_duration = 0.0
 
         try:
-            async for raw_chunk in self.elevenlabs.text_to_speech_stream_twilio(
+            # ✅ FIX: Always pass the stored voice_id so every TTS call uses the SAME voice
+            # ✅ MULTILINGUAL: Pass detected language code for better non-English TTS
+            mulaw_data = await self.elevenlabs.text_to_speech_for_twilio(
                 text,
                 voice_id=self.current_voice_id,
-                language_code=self.detected_language if self.detected_language != "en" else None,
-            ):
-                # ── Barge-in check ───────────────────────────────────────
-                if not self.is_speaking:
-                    try:
-                        await websocket.send_text(json.dumps({
-                            "event": "clear",
-                            "streamSid": stream_sid,
-                        }))
-                    except Exception:
-                        pass
-                    print(f"🛑 [TTS-STREAM] Barge-in mid-stream — stopped + cleared buffer")
-                    break
+                language_code=self.detected_language if self.detected_language != "en" else None
+            )
 
-                buffer += raw_chunk
+            if mulaw_data:
+                # ✅ Calculate actual audio duration
+                audio_duration = len(mulaw_data) / 8000.0  # 8kHz sample rate
+                
+                print(f"✅ [TTS] Got {len(mulaw_data)} bytes ({audio_duration:.2f}s duration)")
+                await self.send_mulaw_audio(mulaw_data, websocket, stream_sid)
 
-                # Send every complete 320-byte chunk immediately
-                while len(buffer) >= chunk_size:
-                    audio_chunk = buffer[:chunk_size]
-                    buffer = buffer[chunk_size:]
-
-                    payload = base64.b64encode(audio_chunk).decode("utf-8")
-                    await websocket.send_text(json.dumps({
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {"payload": payload},
-                    }))
-                    total_bytes += chunk_size
-
-                    if not first_chunk_logged:
-                        first_chunk_logged = True
-                        print(f"⚡ [TTS-STREAM] First chunk sent in {(time.time()-start_time)*1000:.0f} ms")
-
-            # Flush any remaining bytes (pad to 320 with silence)
-            if buffer and self.is_speaking:
-                if len(buffer) % chunk_size:
-                    buffer += b"\xff" * (chunk_size - len(buffer) % chunk_size)
-                payload = base64.b64encode(buffer).decode("utf-8")
-                await websocket.send_text(json.dumps({
-                    "event": "media",
-                    "streamSid": stream_sid,
-                    "media": {"payload": payload},
-                }))
-                total_bytes += len(buffer)
+                print(f"📤 [SENT] Audio sent ({audio_duration:.2f}s duration), ready for barge-in")
+            else:
+                print(f"❌ [TTS] Failed to generate audio")
 
         except asyncio.CancelledError:
-            print("🛑 [TTS-STREAM] Cancelled (barge-in)")
+            print("🛑 [TTS] Cancelled (barge-in detected)")
             raise
         except Exception as e:
-            print(f"❌ [TTS-STREAM-ERROR] {e}")
+            print(f"❌ [TTS-ERROR] {e}")
         finally:
+            tts_time = time.time() - start_time
             self.is_speaking = False
-
-        audio_duration = total_bytes / 8000.0
-        elapsed = time.time() - start_time
-        print(f"✅ [TTS-STREAM] {total_bytes} bytes ({audio_duration:.2f}s audio) in {elapsed:.2f}s wall-time")
+            print(f"✅ [TTS] Completed in {tts_time:.2f}s")
+        
         return audio_duration
 
     async def store_transcript(self, db, call_id, call_sid, user_text, agent_text):
