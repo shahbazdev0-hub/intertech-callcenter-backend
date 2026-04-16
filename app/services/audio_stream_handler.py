@@ -82,6 +82,12 @@ class AudioStreamHandler:
         self.max_history_messages = 5
         self.current_voice_id = None
 
+        # ✅ Pre-generated first response (for instant reply when user says "Hello")
+        self.first_hello_audio: Optional[bytes] = None   # pre-generated mulaw bytes
+        self.first_hello_text: str = ""                  # corresponding text
+        self.first_hello_ready = asyncio.Event()         # set when pre-gen complete
+        self._first_utterance_processed = False          # True after first user speech handled
+
         # ✅ Language detection state
         self.detected_language = "en"  # Default: English
         self.language_name = "English"
@@ -136,23 +142,106 @@ class AudioStreamHandler:
             "send me these services", "send me your services",
         ]
 
-        # Junk phrase filter (carrier noise)
+        # Junk phrase filter — carrier/VoIP pre-answer automated messages.
+        # These are checked in on_transcript_received BEFORE adding to the buffer.
+        # Keep phrases short enough to match substrings of longer carrier sentences.
         self.JUNK_PHRASES = [
+            # Connection / hold messages
             "to connect you",
-            "please wait",
-            "connecting your call",
-            "one moment",
-            "thank you for calling",
-            "is being recorded",
             "try to connect",
-            "connect you",
-            "hold please", "moment", "wait",
+            "connecting your call",
+            "connecting you",
+            "please wait",
+            "please hold",
+            "one moment please",
+            "just a moment",
+            "hold please",
+            "hold for",
+            "hold on",
+            # Recording notices
+            "is being recorded",
+            "may be recorded",
+            "call may be recorded",
+            "this call is recorded",
+            "recorded for",
+            # Transfer / forwarding notices (pre-voicemail)
             "forwarded to",
+            "being transferred",
+            "transferring your call",
+            "routing your call",
+            # Carrier ring-back / queue messages
+            "thank you for your patience",
+            "all our agents",
+            "currently busy",
+            "high call volume",
+            "queue",
+            "estimated wait",
+            "your call is important",
+            "try your call again",
+            # Voicemail system (also in VOICEMAIL_PHRASES — belt and suspenders)
             "voice mail",
             "voicemail",
             "leave a message",
             "at the tone",
-            "after the beep"
+            "after the beep",
+            "after the tone",
+        ]
+
+        # Voicemail / answering-machine phrases — when detected in STT output, hang up immediately.
+        # These are phrases spoken BY the voicemail system, not by the customer.
+        self.VOICEMAIL_PHRASES = [
+            # Core voicemail indicators
+            "leave a message",
+            "leave your message",
+            "record your message",
+            "record a message",
+            "voicemail",
+            "voice mail",
+            "voice mailbox",
+            "mailbox is full",
+            "mailbox full",
+            # Tone / beep instructions
+            "after the tone",
+            "after the beep",
+            "at the tone",
+            "at the beep",
+            "following the tone",
+            "following the beep",
+            "when you hear the tone",
+            "when you hear the beep",
+            # Not available phrases
+            "not available",
+            "is not available",
+            "am not available",
+            "currently unavailable",
+            "cannot come to the phone",
+            "can't come to the phone",
+            "is away",
+            "is out of the office",
+            "out of the office",
+            # Forwarded / redirect phrases
+            "forwarded to voicemail",
+            "forwarded to voice mail",
+            "transferred to voicemail",
+            "directed to voicemail",
+            "sent to voicemail",
+            # Please leave / try again
+            "please leave",
+            "please try again",
+            "try your call again",
+            # Automated system indicators
+            "this is an automated",
+            "automated message",
+            "no one is available",
+            "no one is here",
+            "press 1 to leave",
+            "to leave a message press",
+            "to leave a message, press",
+            # Answering machine direct phrases
+            "answering machine",
+            "you have reached",
+            "you've reached the voicemail",
+            "you've reached the voice mail",
         ]
 
         # Human greeting triggers
@@ -462,6 +551,7 @@ class AudioStreamHandler:
             deepgram_ready = asyncio.Event()
             first_user_speech_received = False
             call_start_time = time.time()
+            greeting_end_time = 0.0   # set when greeting_done fires — used for pre-answer guard
             MAX_SILENCE_BEFORE_HANGUP = 30
 
             stream_sid_inbound = initial_stream_sid
@@ -603,6 +693,38 @@ class AudioStreamHandler:
                         self.last_barge_in_time = time.time()
 
                     if is_final:
+                        sentence_lower = sentence.lower()
+
+                        # ── Layer 1: Junk/carrier phrase filter ───────────────
+                        # These are automated messages from the carrier or VoIP
+                        # system (RingCentral, PBX, etc.) that fire during the
+                        # ringing phase BEFORE the human actually picks up.
+                        if any(phrase in sentence_lower for phrase in self.JUNK_PHRASES):
+                            junk_match = next(p for p in self.JUNK_PHRASES if p in sentence_lower)
+                            print(f"🚫 [JUNK] Carrier phrase discarded ('{junk_match}'): '{sentence[:70]}'")
+                            last_speech_time = time.time()  # still reset silence timer
+                            return
+
+                        # ── Layer 2: Post-greeting pre-answer time guard ───────
+                        # After the greeting finishes (greeting_end_time set below),
+                        # give a 2.5s window where we require the transcript to
+                        # sound human (contains a greeting word) before buffering.
+                        # This catches carrier messages NOT in JUNK_PHRASES.
+                        nonlocal greeting_end_time
+                        if greeting_end_time == 0.0 and self.greeting_done.is_set():
+                            greeting_end_time = time.time()
+
+                        if (greeting_end_time > 0
+                                and not first_user_speech_received
+                                and (time.time() - greeting_end_time) < 2.5):
+                            _human_signals = ["hello", "hi", "hey", "yes", "yeah", "speaking",
+                                              "who", "what", "this is", "i am", "this"]
+                            if not any(sig in sentence_lower for sig in _human_signals):
+                                print(f"🚫 [PRE-ANSWER] Discarding pre-answer transcript "
+                                      f"({(time.time()-greeting_end_time):.1f}s after greeting): '{sentence[:70]}'")
+                                last_speech_time = time.time()
+                                return
+
                         print(f"📝 [TRANSCRIPT] '{sentence}'")
                         transcript_buffer.append(sentence)
                         last_speech_time = time.time()
@@ -1052,6 +1174,11 @@ class AudioStreamHandler:
             })
             print(f"💬 [GREETING] Added to conversation history: '{greeting_text[:60]}...'")
 
+            # ✅ FAST-PATH: Pre-generate response to "Hello" in the background while
+            # the user decides to speak.  Uses a copy of history — no shared state mutation.
+            asyncio.create_task(self._pregen_first_hello_response(agent_config))
+            print(f"🔮 [PREGEN] Launched background first-hello pre-generation")
+
         except Exception as e:
             print(f"❌ [GREETING-ERROR] {e}")
             import traceback
@@ -1059,6 +1186,67 @@ class AudioStreamHandler:
         finally:
             self.greeting_done.set()
             print(f"✅ [GREETING] greeting_done event set — AI responses unblocked")
+
+    async def _pregen_first_hello_response(self, agent_config: Dict[str, Any]):
+        """
+        Background task — pre-generate the AI's response to a greeting ("Hello / Hi / Hey")
+        while the greeting audio is still playing.  Result stored in self.first_hello_audio
+        so _process_user_utterance_inner can play it instantly with zero LLM + TTS latency.
+
+        Uses a COPY of conversation_history (does NOT mutate shared state).
+        """
+        try:
+            print(f"🔮 [PREGEN] Starting first-hello pre-generation in background...")
+            t0 = time.time()
+
+            agent_context = agent_config.get("agent_context", {})
+            raw_script = agent_config.get("ai_script", "")
+            system_prompt = self.openai.build_contextual_system_prompt(
+                agent_context=agent_context,
+                agent_name=agent_config.get("name", "AI Assistant"),
+                ai_script=raw_script,
+                language=self.detected_language,
+                language_name=self.language_name,
+            )
+
+            # Snapshot current history (greeting already appended) + simulate "Hello"
+            temp_history = list(self.conversation_history) + [
+                {"role": "user", "content": "Hello"}
+            ]
+
+            # Collect full LLM response (streaming but without playing)
+            full_text = ""
+            async for chunk in self.openai.generate_chat_response_stream(
+                messages=temp_history,
+                system_prompt=system_prompt,
+            ):
+                full_text += chunk
+
+            full_text = full_text.strip()
+            if not full_text:
+                print(f"⚠️ [PREGEN] Empty LLM response — skipping TTS pre-gen")
+                return
+
+            print(f"🔮 [PREGEN] LLM done in {time.time()-t0:.2f}s: '{full_text[:80]}...'")
+
+            # Generate TTS audio (mulaw bytes) without playing
+            mulaw_data = await self.elevenlabs.text_to_speech_for_twilio(
+                full_text,
+                voice_id=self.current_voice_id,
+                language_code=self.detected_language if self.detected_language != "en" else None,
+            )
+
+            if mulaw_data:
+                self.first_hello_audio = mulaw_data
+                self.first_hello_text = full_text
+                self.first_hello_ready.set()
+                print(f"✅ [PREGEN] Ready in {time.time()-t0:.2f}s ({len(mulaw_data)} bytes) — "
+                      f"first Hello will be instant!")
+            else:
+                print(f"⚠️ [PREGEN] TTS returned empty bytes")
+
+        except Exception as e:
+            print(f"⚠️ [PREGEN] Background pre-gen failed (non-fatal): {e}")
 
     async def send_mulaw_audio(self, mulaw_data: bytes, websocket, stream_sid: str):
         """Send mulaw audio to Twilio - REAL-TIME PACED with barge-in support.
@@ -1214,6 +1402,59 @@ class AudioStreamHandler:
 
         start_time = time.time()
         text_lower = text.lower().strip()
+
+        # ── VOICEMAIL DETECTION ──────────────────────────────────────────────
+        # Check BEFORE anything else. If the STT hears voicemail system speech,
+        # hang up immediately — no greeting, no AI response, no transcript stored.
+        if any(phrase in text_lower for phrase in self.VOICEMAIL_PHRASES):
+            matched = next(p for p in self.VOICEMAIL_PHRASES if p in text_lower)
+            print(f"📵 [VOICEMAIL] Detected voicemail system: '{text[:80]}' (matched: '{matched}')")
+            print(f"📵 [VOICEMAIL] Hanging up call {call_sid}")
+            try:
+                twilio_service.hangup_call(call_sid)
+            except Exception as e:
+                print(f"⚠️ [VOICEMAIL] hangup_call error: {e}")
+            try:
+                await db.calls.update_one(
+                    {"twilio_call_sid": call_sid},
+                    {"$set": {
+                        "status": "voicemail_detected",
+                        "voicemail_phrase": matched,
+                        "ended_at": datetime.utcnow(),
+                        "updated_at": datetime.utcnow(),
+                    }}
+                )
+            except Exception as e:
+                print(f"⚠️ [VOICEMAIL] DB update error: {e}")
+            return  # exit — no AI response
+        # ────────────────────────────────────────────────────────────────────
+
+        # ✅ FAST-PATH: Pre-generated first-hello response — zero LLM + TTS latency.
+        # Only fires for the very first user utterance when it is a short greeting
+        # AND the background pre-gen task already finished.
+        _GREETING_WORDS = {"hello", "hi", "hey", "yes", "yeah", "yep", "yup",
+                           "speaking", "good morning", "good afternoon", "good evening"}
+        _is_first_utterance = not self._first_utterance_processed
+        _is_greeting = text_lower.strip().rstrip("?.!, ") in _GREETING_WORDS or text_lower.strip() in _GREETING_WORDS
+        if _is_first_utterance and _is_greeting and self.first_hello_ready.is_set() and self.first_hello_audio:
+            print(f"⚡ [FAST-PATH] Using pre-generated first-hello response (0 LLM/TTS delay)")
+            self._first_utterance_processed = True
+            cached_audio = self.first_hello_audio
+            cached_text = self.first_hello_text
+            # Add to conversation history exactly as the normal path would
+            self.conversation_history.append({"role": "user", "content": text})
+            self.conversation_history.append({"role": "assistant", "content": cached_text})
+            await self.store_transcript(db, call_id, call_sid, text, cached_text)
+            # Play immediately — no TTS call needed
+            self.is_speaking = True
+            await self.send_mulaw_audio(cached_audio, websocket, stream_sid)
+            self.is_speaking = False
+            print(f"✅ [FAST-PATH] Played pre-generated response: '{cached_text[:80]}...'")
+            return
+        # Mark first utterance processed even if fast-path wasn't used
+        if _is_first_utterance:
+            self._first_utterance_processed = True
+        # ────────────────────────────────────────────────────────────────────
 
         # ✅ LANGUAGE DETECTION: Run in background — don't block the response path.
         # detected_language is only needed for TTS which starts after LLM generation
@@ -1441,7 +1682,8 @@ class AudioStreamHandler:
                     user_id=user_id,
                     call_id=call_id,
                     db=db,
-                    call_sid=call_sid
+                    call_sid=call_sid,
+                    conversation_history=self.conversation_history,
                 )
                 if payment_response:
                     print(f"💳 [PAYMENT-RESPONSE] {payment_response[:100]}...")
@@ -1472,7 +1714,8 @@ class AudioStreamHandler:
                     user_id=user_id,
                     call_id=call_id,
                     db=db,
-                    call_sid=call_sid
+                    call_sid=call_sid,
+                    conversation_history=self.conversation_history,
                 )
                 if booking_response:
                     print(f"📅 [BOOKING-RESPONSE] {booking_response[:100]}...")
