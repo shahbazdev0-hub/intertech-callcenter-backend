@@ -206,7 +206,8 @@ class AgentExecutor:
         user_id: str,
         call_id: str,
         db: AsyncIOMotorDatabase,
-        call_sid: str = None  # ✅ NEW PARAMETER
+        call_sid: str = None,
+        conversation_history: list = None,
     ) -> str:
         """
         ✅ NEW: Fast contextual response system with SALES FOCUS
@@ -229,6 +230,7 @@ class AgentExecutor:
             logger.info(f"{'='*80}\n")
             
             user_input_lower = user_input.lower().strip()
+            history = conversation_history or []
 
             # ============================================
             # ✅ SMART INTENT DETECTION
@@ -1601,6 +1603,27 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
 
             # ── Step: Card Number ─────────────────────────────────────────────
             elif step == "card_number":
+                # ── Refusal / no-card detection (must come BEFORE digit extraction) ──
+                _card_refusal_phrases = [
+                    "don't want", "dont want", "do not want",
+                    "won't give", "wont give", "will not give",
+                    "don't have", "dont have", "do not have", "i have no card",
+                    "no card", "no credit card", "no debit card",
+                    "not comfortable", "not willing", "don't feel comfortable",
+                    "prefer not", "rather not", "i'd rather not",
+                    "i refuse", "not going to", "i'm not going",
+                    "skip", "skip it", "skip this", "pass",
+                    "cancel", "stop", "never mind", "nevermind", "forget it",
+                    "i can't", "i cannot", "unable to",
+                ]
+                if any(phrase in user_input_lower for phrase in _card_refusal_phrases):
+                    logger.info(f"💳 [CARD-REFUSED] User declined to provide card: '{user_input[:60]}'")
+                    return (
+                        "No problem at all. Just to let you know, we'll need a card to complete "
+                        "the enrollment. Whenever you're ready, I can take your card number. Would you "
+                        "like to share, iuf you have any other card of any other Bank? Any Valut card would work."
+                    )
+
                 card_number = self._extract_card_number(user_input)
                 if card_number:
                     # ✅ Validate via Luhn algorithm + card type detection
@@ -1720,8 +1743,8 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
 
             # ── Step: Address ─────────────────────────────────────────────────
             elif step == "address":
-                address = user_input.strip()
-                if len(address) >= 5:
+                address = self._extract_address(user_input)
+                if address and len(address) >= 5:
                     collected["address"] = address
                     state["step"] = "confirm"
                     name = collected.get("cardholder_name", "")
@@ -1735,7 +1758,7 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
                         f"expiry {expiry}, bank {bank}, phone {phone}. "
                         f"Is everything correct?"
                     )
-                return "I didn't catch your address. Could you please say your street address, city, and state?"
+                return "I didn't catch your address. Could you say your street, city, and state? For example: 123 Main Street, Austin, Texas."
 
             # ── Step: Confirm ─────────────────────────────────────────────────
             elif step == "confirm":
@@ -2177,16 +2200,26 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
                 "tomorrow", "today", "yesterday", "later", "now", "soon", "morning", "afternoon", "evening", "night",
                 # Common responses
                 "please", "sure", "yes", "no", "ok", "okay", "thanks", "thank", "hello", "hi", "hey", "bye", "goodbye",
-                # Booking words  
+                # Positive filler responses that sound like agreement
+                "perfect", "great", "fine", "right", "good", "done", "alright", "gotcha", "noted",
+                "correct", "exactly", "understood", "agreed", "confirm", "confirmed",
+                # Negative / hesitation words
+                "not", "never", "nope", "nah", "no", "none", "nothing", "neither",
+                "wait", "hold", "stop", "pause", "actually", "hmm", "hm",
+                # Booking words
                 "appointment", "book", "schedule", "call", "busy", "service", "serve", "consultation",
                 # Business words
                 "discount", "price", "help", "want", "need", "your", "you", "the", "services", "product", "products",
                 # Grammar words
                 "can", "will", "would", "could", "should", "about", "i", "an", "a", "to", "for", "at", "in", "on", "of",
+                "this", "that", "these", "those", "there", "here", "what", "which", "when", "where", "who", "how", "why",
+                "and", "or", "but", "if", "then", "than", "with", "from", "into", "onto", "upon", "not",
                 # Filler words - CRITICAL
                 "mean", "like", "just", "well", "so", "um", "uh", "actually", "basically", "literally", "really",
                 # Other common non-names
-                "maybe", "perhaps", "probably", "definitely", "absolutely", "certainly"
+                "maybe", "perhaps", "probably", "definitely", "absolutely", "certainly",
+                # Numbers as words (sometimes STT outputs these)
+                "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
             ]
             
             # ✅ Check if the ENTIRE input is a non-name word
@@ -2206,8 +2239,10 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
             # ✅ Only extract if user explicitly says their name
             import re
             name_patterns = [
-                r"(?:my name is|i am|i'm|this is|call me|it's|its|name's)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)",
-                r"^([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?)$"  # Standalone capitalized name (min 3 chars)
+                # Prefix pattern: captures up to 4 words after "my name is / I am / ..." etc.
+                r"(?:my name is|i am|i'm|this is|call me|it's|its|name's)\s+([A-Za-z]+(?:\s+[A-Za-z]+){0,3})",
+                # Standalone name: 1–4 capitalised words, each at least 2 chars (IGNORECASE handles lowercase STT output)
+                r"^([A-Za-z]{2,}(?:\s+[A-Za-z]{2,}){0,3})$",
             ]
             
             for pattern in name_patterns:
@@ -2217,22 +2252,30 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
                     
                     # Validate extracted name - check each word
                     name_words = name.lower().split()
-                    
+
                     # Reject if ANY word is in not_names
                     if any(word in not_names for word in name_words):
                         logger.info(f"⚠️ Extracted '{name}' but contains invalid word")
                         continue
-                    
+
                     # Reject if name is too short (less than 2 chars) or too long
                     if len(name) < 2 or len(name) > 50:
                         logger.info(f"⚠️ Name '{name}' is too short or too long")
                         continue
-                    
+
                     # Reject single character names
                     if len(name_words) == 1 and len(name_words[0]) < 2:
                         logger.info(f"⚠️ Single char name rejected: '{name}'")
                         continue
-                    
+
+                    # For the standalone pattern (no explicit prefix like "my name is"),
+                    # require at least one word of 3+ chars to avoid accepting two-letter
+                    # common words that slipped through not_names (e.g. "do", "go", "be")
+                    if pattern == name_patterns[1]:  # standalone pattern
+                        if not any(len(w) >= 3 for w in name_words):
+                            logger.info(f"⚠️ Standalone name '{name}' — all words too short, likely not a name")
+                            continue
+
                     logger.info(f"✅ Name extracted: '{name}'")
                     return name
             
@@ -2265,6 +2308,73 @@ f"Great question! Let me share how {company_name}'s services could benefit you. 
             return None
     
     
+    def _extract_address(self, user_input: str) -> Optional[str]:
+        """
+        Strip conversational filler from a spoken address and return just the
+        address text.  Examples:
+          "Yeah, it's Austin, Texas."       → "Austin, Texas"
+          "My address is 123 Main St, Dallas, TX"  → "123 Main St, Dallas, TX"
+          "Sure, 45 Elm Avenue, New York"   → "45 Elm Avenue, New York"
+          "It's 7 Oak Lane"                 → "7 Oak Lane"
+        """
+        import re
+
+        text = user_input.strip()
+
+        # ── Strip leading filler phrases (longest first so "yes it is" beats "yes") ──
+        _fillers = [
+            "my address is", "my home address is", "the address is",
+            "address is", "it's at", "it is at", "i live at", "i'm at",
+            "i am at", "located at", "we are at", "we're at",
+            "sure it's", "sure it is", "sure,", "sure",
+            "yeah it's", "yeah it is", "yeah,", "yeah",
+            "yes it's", "yes it is", "yes,", "yes",
+            "okay it's", "okay it is", "okay,", "okay", "ok,", "ok",
+            "so it's", "so it is", "so,",
+            "it's", "it is", "its",
+            "well,", "well",
+            "um,", "um", "uh,", "uh",
+        ]
+        text_lower = text.lower()
+        for filler in sorted(_fillers, key=len, reverse=True):
+            if text_lower.startswith(filler):
+                remainder = text[len(filler):].lstrip(" ,.")
+                if remainder:
+                    text = remainder
+                    text_lower = text.lower()
+                break  # only strip one leading filler
+
+        # ── Strip common trailing noise ─────────────────────────────────────
+        _trailing = [
+            r"\s+is that (ok|okay|right|correct|fine)\??$",
+            r"\s+(that'?s? it|that is it|that'?s? all|that'?s? my address)\.?$",
+            r"\s+[,.]?$",
+        ]
+        for pattern in _trailing:
+            text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+
+        # ── Strip trailing punctuation ───────────────────────────────────────
+        text = text.strip(" .,!?")
+
+        # ── Capitalise sensibly (title-case) ────────────────────────────────
+        # Keep small words lowercase (of, the, etc.) unless they start the string
+        _small = {"of", "the", "and", "in", "on", "at", "to", "a", "an"}
+        words = text.split()
+        result_words = []
+        for i, w in enumerate(words):
+            if i == 0 or w.lower() not in _small:
+                result_words.append(w.capitalize())
+            else:
+                result_words.append(w.lower())
+        text = " ".join(result_words)
+
+        if len(text) >= 5:
+            logger.info(f"🏠 [ADDRESS] Extracted: '{text}'")
+            return text
+
+        logger.info(f"⚠️ [ADDRESS] Could not extract from: '{user_input[:60]}'")
+        return None
+
     async def _extract_email_enhanced_ai(self, user_input: str) -> Optional[str]:
         """
         ✅ AI-POWERED: Extract email from voice input using the LLM.
