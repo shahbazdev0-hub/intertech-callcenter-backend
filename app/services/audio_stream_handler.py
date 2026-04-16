@@ -82,6 +82,12 @@ class AudioStreamHandler:
         self.max_history_messages = 5
         self.current_voice_id = None
 
+        # ✅ Pre-generated first response (for instant reply when user says "Hello")
+        self.first_hello_audio: Optional[bytes] = None   # pre-generated mulaw bytes
+        self.first_hello_text: str = ""                  # corresponding text
+        self.first_hello_ready = asyncio.Event()         # set when pre-gen complete
+        self._first_utterance_processed = False          # True after first user speech handled
+
         # ✅ Language detection state
         self.detected_language = "en"  # Default: English
         self.language_name = "English"
@@ -1168,6 +1174,11 @@ class AudioStreamHandler:
             })
             print(f"💬 [GREETING] Added to conversation history: '{greeting_text[:60]}...'")
 
+            # ✅ FAST-PATH: Pre-generate response to "Hello" in the background while
+            # the user decides to speak.  Uses a copy of history — no shared state mutation.
+            asyncio.create_task(self._pregen_first_hello_response(agent_config))
+            print(f"🔮 [PREGEN] Launched background first-hello pre-generation")
+
         except Exception as e:
             print(f"❌ [GREETING-ERROR] {e}")
             import traceback
@@ -1175,6 +1186,67 @@ class AudioStreamHandler:
         finally:
             self.greeting_done.set()
             print(f"✅ [GREETING] greeting_done event set — AI responses unblocked")
+
+    async def _pregen_first_hello_response(self, agent_config: Dict[str, Any]):
+        """
+        Background task — pre-generate the AI's response to a greeting ("Hello / Hi / Hey")
+        while the greeting audio is still playing.  Result stored in self.first_hello_audio
+        so _process_user_utterance_inner can play it instantly with zero LLM + TTS latency.
+
+        Uses a COPY of conversation_history (does NOT mutate shared state).
+        """
+        try:
+            print(f"🔮 [PREGEN] Starting first-hello pre-generation in background...")
+            t0 = time.time()
+
+            agent_context = agent_config.get("agent_context", {})
+            raw_script = agent_config.get("ai_script", "")
+            system_prompt = self.openai.build_contextual_system_prompt(
+                agent_context=agent_context,
+                agent_name=agent_config.get("name", "AI Assistant"),
+                ai_script=raw_script,
+                language=self.detected_language,
+                language_name=self.language_name,
+            )
+
+            # Snapshot current history (greeting already appended) + simulate "Hello"
+            temp_history = list(self.conversation_history) + [
+                {"role": "user", "content": "Hello"}
+            ]
+
+            # Collect full LLM response (streaming but without playing)
+            full_text = ""
+            async for chunk in self.openai.generate_chat_response_stream(
+                messages=temp_history,
+                system_prompt=system_prompt,
+            ):
+                full_text += chunk
+
+            full_text = full_text.strip()
+            if not full_text:
+                print(f"⚠️ [PREGEN] Empty LLM response — skipping TTS pre-gen")
+                return
+
+            print(f"🔮 [PREGEN] LLM done in {time.time()-t0:.2f}s: '{full_text[:80]}...'")
+
+            # Generate TTS audio (mulaw bytes) without playing
+            mulaw_data = await self.elevenlabs.text_to_speech_for_twilio(
+                full_text,
+                voice_id=self.current_voice_id,
+                language_code=self.detected_language if self.detected_language != "en" else None,
+            )
+
+            if mulaw_data:
+                self.first_hello_audio = mulaw_data
+                self.first_hello_text = full_text
+                self.first_hello_ready.set()
+                print(f"✅ [PREGEN] Ready in {time.time()-t0:.2f}s ({len(mulaw_data)} bytes) — "
+                      f"first Hello will be instant!")
+            else:
+                print(f"⚠️ [PREGEN] TTS returned empty bytes")
+
+        except Exception as e:
+            print(f"⚠️ [PREGEN] Background pre-gen failed (non-fatal): {e}")
 
     async def send_mulaw_audio(self, mulaw_data: bytes, websocket, stream_sid: str):
         """Send mulaw audio to Twilio - REAL-TIME PACED with barge-in support.
@@ -1355,6 +1427,33 @@ class AudioStreamHandler:
             except Exception as e:
                 print(f"⚠️ [VOICEMAIL] DB update error: {e}")
             return  # exit — no AI response
+        # ────────────────────────────────────────────────────────────────────
+
+        # ✅ FAST-PATH: Pre-generated first-hello response — zero LLM + TTS latency.
+        # Only fires for the very first user utterance when it is a short greeting
+        # AND the background pre-gen task already finished.
+        _GREETING_WORDS = {"hello", "hi", "hey", "yes", "yeah", "yep", "yup",
+                           "speaking", "good morning", "good afternoon", "good evening"}
+        _is_first_utterance = not self._first_utterance_processed
+        _is_greeting = text_lower.strip().rstrip("?.!, ") in _GREETING_WORDS or text_lower.strip() in _GREETING_WORDS
+        if _is_first_utterance and _is_greeting and self.first_hello_ready.is_set() and self.first_hello_audio:
+            print(f"⚡ [FAST-PATH] Using pre-generated first-hello response (0 LLM/TTS delay)")
+            self._first_utterance_processed = True
+            cached_audio = self.first_hello_audio
+            cached_text = self.first_hello_text
+            # Add to conversation history exactly as the normal path would
+            self.conversation_history.append({"role": "user", "content": text})
+            self.conversation_history.append({"role": "assistant", "content": cached_text})
+            await self.store_transcript(db, call_id, call_sid, text, cached_text)
+            # Play immediately — no TTS call needed
+            self.is_speaking = True
+            await self.send_mulaw_audio(cached_audio, websocket, stream_sid)
+            self.is_speaking = False
+            print(f"✅ [FAST-PATH] Played pre-generated response: '{cached_text[:80]}...'")
+            return
+        # Mark first utterance processed even if fast-path wasn't used
+        if _is_first_utterance:
+            self._first_utterance_processed = True
         # ────────────────────────────────────────────────────────────────────
 
         # ✅ LANGUAGE DETECTION: Run in background — don't block the response path.
