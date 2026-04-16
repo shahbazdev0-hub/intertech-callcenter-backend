@@ -136,23 +136,106 @@ class AudioStreamHandler:
             "send me these services", "send me your services",
         ]
 
-        # Junk phrase filter (carrier noise)
+        # Junk phrase filter — carrier/VoIP pre-answer automated messages.
+        # These are checked in on_transcript_received BEFORE adding to the buffer.
+        # Keep phrases short enough to match substrings of longer carrier sentences.
         self.JUNK_PHRASES = [
+            # Connection / hold messages
             "to connect you",
-            "please wait",
-            "connecting your call",
-            "one moment",
-            "thank you for calling",
-            "is being recorded",
             "try to connect",
-            "connect you",
-            "hold please", "moment", "wait",
+            "connecting your call",
+            "connecting you",
+            "please wait",
+            "please hold",
+            "one moment please",
+            "just a moment",
+            "hold please",
+            "hold for",
+            "hold on",
+            # Recording notices
+            "is being recorded",
+            "may be recorded",
+            "call may be recorded",
+            "this call is recorded",
+            "recorded for",
+            # Transfer / forwarding notices (pre-voicemail)
             "forwarded to",
+            "being transferred",
+            "transferring your call",
+            "routing your call",
+            # Carrier ring-back / queue messages
+            "thank you for your patience",
+            "all our agents",
+            "currently busy",
+            "high call volume",
+            "queue",
+            "estimated wait",
+            "your call is important",
+            "try your call again",
+            # Voicemail system (also in VOICEMAIL_PHRASES — belt and suspenders)
             "voice mail",
             "voicemail",
             "leave a message",
             "at the tone",
-            "after the beep"
+            "after the beep",
+            "after the tone",
+        ]
+
+        # Voicemail / answering-machine phrases — when detected in STT output, hang up immediately.
+        # These are phrases spoken BY the voicemail system, not by the customer.
+        self.VOICEMAIL_PHRASES = [
+            # Core voicemail indicators
+            "leave a message",
+            "leave your message",
+            "record your message",
+            "record a message",
+            "voicemail",
+            "voice mail",
+            "voice mailbox",
+            "mailbox is full",
+            "mailbox full",
+            # Tone / beep instructions
+            "after the tone",
+            "after the beep",
+            "at the tone",
+            "at the beep",
+            "following the tone",
+            "following the beep",
+            "when you hear the tone",
+            "when you hear the beep",
+            # Not available phrases
+            "not available",
+            "is not available",
+            "am not available",
+            "currently unavailable",
+            "cannot come to the phone",
+            "can't come to the phone",
+            "is away",
+            "is out of the office",
+            "out of the office",
+            # Forwarded / redirect phrases
+            "forwarded to voicemail",
+            "forwarded to voice mail",
+            "transferred to voicemail",
+            "directed to voicemail",
+            "sent to voicemail",
+            # Please leave / try again
+            "please leave",
+            "please try again",
+            "try your call again",
+            # Automated system indicators
+            "this is an automated",
+            "automated message",
+            "no one is available",
+            "no one is here",
+            "press 1 to leave",
+            "to leave a message press",
+            "to leave a message, press",
+            # Answering machine direct phrases
+            "answering machine",
+            "you have reached",
+            "you've reached the voicemail",
+            "you've reached the voice mail",
         ]
 
         # Human greeting triggers
@@ -462,6 +545,7 @@ class AudioStreamHandler:
             deepgram_ready = asyncio.Event()
             first_user_speech_received = False
             call_start_time = time.time()
+            greeting_end_time = 0.0   # set when greeting_done fires — used for pre-answer guard
             MAX_SILENCE_BEFORE_HANGUP = 30
 
             stream_sid_inbound = initial_stream_sid
@@ -603,6 +687,38 @@ class AudioStreamHandler:
                         self.last_barge_in_time = time.time()
 
                     if is_final:
+                        sentence_lower = sentence.lower()
+
+                        # ── Layer 1: Junk/carrier phrase filter ───────────────
+                        # These are automated messages from the carrier or VoIP
+                        # system (RingCentral, PBX, etc.) that fire during the
+                        # ringing phase BEFORE the human actually picks up.
+                        if any(phrase in sentence_lower for phrase in self.JUNK_PHRASES):
+                            junk_match = next(p for p in self.JUNK_PHRASES if p in sentence_lower)
+                            print(f"🚫 [JUNK] Carrier phrase discarded ('{junk_match}'): '{sentence[:70]}'")
+                            last_speech_time = time.time()  # still reset silence timer
+                            return
+
+                        # ── Layer 2: Post-greeting pre-answer time guard ───────
+                        # After the greeting finishes (greeting_end_time set below),
+                        # give a 2.5s window where we require the transcript to
+                        # sound human (contains a greeting word) before buffering.
+                        # This catches carrier messages NOT in JUNK_PHRASES.
+                        nonlocal greeting_end_time
+                        if greeting_end_time == 0.0 and self.greeting_done.is_set():
+                            greeting_end_time = time.time()
+
+                        if (greeting_end_time > 0
+                                and not first_user_speech_received
+                                and (time.time() - greeting_end_time) < 2.5):
+                            _human_signals = ["hello", "hi", "hey", "yes", "yeah", "speaking",
+                                              "who", "what", "this is", "i am", "this"]
+                            if not any(sig in sentence_lower for sig in _human_signals):
+                                print(f"🚫 [PRE-ANSWER] Discarding pre-answer transcript "
+                                      f"({(time.time()-greeting_end_time):.1f}s after greeting): '{sentence[:70]}'")
+                                last_speech_time = time.time()
+                                return
+
                         print(f"📝 [TRANSCRIPT] '{sentence}'")
                         transcript_buffer.append(sentence)
                         last_speech_time = time.time()
@@ -1215,6 +1331,32 @@ class AudioStreamHandler:
         start_time = time.time()
         text_lower = text.lower().strip()
 
+        # ── VOICEMAIL DETECTION ──────────────────────────────────────────────
+        # Check BEFORE anything else. If the STT hears voicemail system speech,
+        # hang up immediately — no greeting, no AI response, no transcript stored.
+        if any(phrase in text_lower for phrase in self.VOICEMAIL_PHRASES):
+            matched = next(p for p in self.VOICEMAIL_PHRASES if p in text_lower)
+            print(f"📵 [VOICEMAIL] Detected voicemail system: '{text[:80]}' (matched: '{matched}')")
+            print(f"📵 [VOICEMAIL] Hanging up call {call_sid}")
+            try:
+                twilio_service.hangup_call(call_sid)
+            except Exception as e:
+                print(f"⚠️ [VOICEMAIL] hangup_call error: {e}")
+            try:
+                await db.calls.update_one(
+                    {"twilio_call_sid": call_sid},
+                    {"$set": {
+                        "status": "voicemail_detected",
+                        "voicemail_phrase": matched,
+                        "ended_at": datetime.utcnow(),
+                        "updated_at": datetime.utcnow(),
+                    }}
+                )
+            except Exception as e:
+                print(f"⚠️ [VOICEMAIL] DB update error: {e}")
+            return  # exit — no AI response
+        # ────────────────────────────────────────────────────────────────────
+
         # ✅ LANGUAGE DETECTION: Run in background — don't block the response path.
         # detected_language is only needed for TTS which starts after LLM generation
         # (~0.5-1s later), giving the background task enough time to complete.
@@ -1441,7 +1583,8 @@ class AudioStreamHandler:
                     user_id=user_id,
                     call_id=call_id,
                     db=db,
-                    call_sid=call_sid
+                    call_sid=call_sid,
+                    conversation_history=self.conversation_history,
                 )
                 if payment_response:
                     print(f"💳 [PAYMENT-RESPONSE] {payment_response[:100]}...")
@@ -1472,7 +1615,8 @@ class AudioStreamHandler:
                     user_id=user_id,
                     call_id=call_id,
                     db=db,
-                    call_sid=call_sid
+                    call_sid=call_sid,
+                    conversation_history=self.conversation_history,
                 )
                 if booking_response:
                     print(f"📅 [BOOKING-RESPONSE] {booking_response[:100]}...")
